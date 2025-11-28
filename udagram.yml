@@ -1,0 +1,278 @@
+Description: CD12352 - Infrastructure as Code Project - Udagram
+
+Parameters:
+  
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+
+
+Resources:
+  
+  # Server resources
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http access to our load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http access to our hosts from the LB Security Group
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties: 
+      LaunchTemplateName: !Sub "${EnvironmentName}-web-servers"
+      LaunchTemplateData:
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            apt-get update -y
+            apt-get install -y nginx awscli
+
+            # Download index.html from S3
+            aws s3 cp s3://${S3Bucket}/index.html /var/www/html/index.html
+
+            systemctl enable nginx
+            systemctl restart nginx
+        ImageId: ami-0c398cb65a93047f2 # Ubuntu Server 20.04 LTS (HVM), SSD Volume Type - us-east-1
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        InstanceType: t3.micro # Free tier eligible
+        BlockDeviceMappings:
+        - DeviceName: "/dev/sdk"
+          Ebs:
+            VolumeSize: '10'
+        IamInstanceProfile:
+          Name: !Ref InstanceProfile
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-web-servers"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: 'Allow'
+          Principal:
+            Service:
+            - 'ec2.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: s3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              Resource:
+                - !Sub "arn:aws:s3:::${S3Bucket}/*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: '/'
+      Roles:
+      - !Ref InstanceRole
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${EnvironmentName}-PRIV-NETS"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      DesiredCapacity: '1'
+      MaxSize: '3'
+      TargetGroupARNs:
+      - Ref: TargetGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LoadBalancerSecurityGroup
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: TargetGroup
+      LoadBalancerArn:
+        Ref: LoadBalancer
+      Port: '80'
+      Protocol: HTTP
+
+  ListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'TargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"
+
+  # S3 resources
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: "udagram-zeeshan"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicRead
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+            Resource: !Sub "${S3Bucket.Arn}/*"
+
+#Lambda function to add index.html to the S3 bucket
+
+  S3ObjectWriterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt S3ObjectLambdaExecutionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              s3 = boto3.client("s3")
+
+              bucket = event["ResourceProperties"]["BucketName"]
+              key = event["ResourceProperties"]["ObjectKey"]
+              content = event["ResourceProperties"]["Content"]
+
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=key,
+                          Body=content,
+                          ContentType="text/html"
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  S3ObjectLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Writer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: "arn:aws:s3:::udagram-zeeshan/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  UploadIndexHtml:
+    Type: Custom::S3ObjectWriter
+    Properties:
+      ServiceToken: !GetAtt S3ObjectWriterFunction.Arn
+      BucketName: !Ref S3Bucket
+      ObjectKey: "index.html"
+      Content: |
+        <!DOCTYPE html>
+        <html>
+        <head><title>It works! Udagram</title></head>
+        <body>
+          <h1>It works! Udagram, Udacity</h1>
+          <p>This file was provisioned by CloudFormation.</p>
+        </body>
+        </html>
+    DependsOn: S3Bucket
+
+
+
+
+Outputs:
+
+  LoadBalancerURL:
+    Description: URL of the load balancer
+    Value: !Sub http://${LoadBalancer.DNSName}
+    Export:
+      Name: !Sub ${EnvironmentName}-LB-DNS
